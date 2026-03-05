@@ -9,6 +9,7 @@ import math
 from sklearn.linear_model import LinearRegression
 from sklearn.cluster import KMeans
 from scipy import stats
+from sklearn.linear_model import Ridge, LinearRegression
 
 # 1. SAYFA KONFİGÜRASYONU
 st.set_page_config(page_title="NBA Analytics", layout="wide", page_icon="🏀")
@@ -73,7 +74,6 @@ else:
     available_players = sorted([p for p in df["Player"].unique() if p in active_players])
     f_df = df[df["Player"].isin(active_players)].copy()
 
-# 📌 HATA BURADA ÇÖZÜLDÜ: Session State, "available_players" tanımlandıktan sonra çalıştırıldı.
 if 'roster_selection' not in st.session_state:
     st.session_state['roster_selection'] = available_players[:5] if len(available_players) >= 5 else available_players
 
@@ -425,22 +425,104 @@ elif menu == "7. 🔬 Akademik İstatistik & Tahmin Modelleri":
                     else: st.success(f"✅ **Sonuç:** p >= {alpha}. '{n_var}' Normal Dağılmaktadır.")
 
     with tab2:
-        st.subheader("📊 Çoklu Doğrusal Regresyon: Adil Piyasa Değeri Tahmini")
-        st.latex(r"\text{Expected Salary} = \beta_0 + \beta_1(\text{PTS}) + \beta_2(\text{AST}) + \beta_3(\text{TRB}) + \beta_4(\text{WS}) + \epsilon")
-        reg_df = f_df[(f_df["Season"] == latest_season) & (f_df["Current_Salary"] > 0)].dropna(subset=["PTS", "AST", "TRB", "WS", "Current_Salary"])
-        if len(reg_df) > 10:
-            X = reg_df[["PTS", "AST", "TRB", "WS"]]
-            y = reg_df["Current_Salary"]
-            mlr_model = LinearRegression().fit(X, y)
-            reg_df["Expected_Salary"] = mlr_model.predict(X)
-            reg_df["Difference"] = reg_df["Expected_Salary"] - reg_df["Current_Salary"]
-            p_sel = st.selectbox("Model Üzerinde Test Edilecek Oyuncu:", sorted(reg_df["Player"].unique()))
-            p_res = reg_df[reg_df["Player"] == p_sel].iloc[0]
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Gerçek Maaşı", fmt_money(p_res['Current_Salary']))
-            c2.metric("Adil Maaş", fmt_money(p_res['Expected_Salary']))
-            if p_res['Difference'] > 0: c3.metric("Durum", "Ucuz", delta=f"+{fmt_money(p_res['Difference'])} Kar")
-            else: c3.metric("Durum", "Pahalı", delta=f"-{fmt_money(abs(p_res['Difference']))} Zarar", delta_color="red")
+        st.subheader("📊 Gelişmiş Regresyon: Adil Piyasa Değeri Tahmini")
+        st.markdown("""
+        Bu model, oyuncuların verimlilik ve savunma metriklerini kullanarak piyasa değerlerini hesaplar. 
+        Özellikle **Modern Basketbol** metrikleri ($TS\%$, $eFG\%$, $3PAr$) ağırlıklı olarak dikkate alınır.
+        """)
+        
+        # --- 1. VERİ HAZIRLIĞI ---
+        current_season_df = f_df[f_df["Season"] == latest_season].copy()
+        
+        # AST/TO ve Verimlilik Kontrolleri
+        if "AST" in current_season_df.columns and "TOV" in current_season_df.columns:
+            current_season_df["AST/TO"] = current_season_df["AST"] / (current_season_df["TOV"] + 0.1)
+        
+        # Senin istediğin "Modern Basketbolun Kalbi" listesi
+        default_features = ["Age", "TS%", "eFG%", "3PAr", "USG%", "AST/TO", "DWS", "DBPM", "VORP"]
+        
+        # Kullanılabilir sayısal sütunları belirle
+        valid_num_cols = [col for col in num_cols if col not in ["Salary", "Current_Salary", "Season", "Player"]]
+        for extra in ["AST/TO"]:
+            if extra in current_season_df.columns and extra not in valid_num_cols:
+                valid_num_cols.append(extra)
+        
+        # --- 2. MODEL PARAMETRELERİ ---
+        c_mod1, c_mod2 = st.columns(2)
+        model_type = c_mod1.radio("Algoritma Seçimi:", ["Ridge Regresyonu (L2 - Kararlı)", "Klasik Regresyon (OLS)"])
+        use_position = c_mod2.checkbox("Pozisyon Etkisini Dahil Et", value=True, help="Pivot ve Guard maaş farklarını modele öğretir.")
+        
+        selected_features = st.multiselect(
+            "Modele Dahil Edilecek Metrikler:", 
+            valid_num_cols, 
+            default=[f for f in default_features if f in valid_num_cols]
+        )
+        
+        if len(selected_features) > 0:
+            # --- 3. DİNAMİK LATEX FORMÜLÜ (Hatasız Versiyon) ---
+            clean_f = [f.replace('%', r'\%') for f in selected_features]
+            if len(clean_f) > 5:
+                terms = [r"\beta_{" + str(i+1) + r"}(\text{" + f + r"})" for i, f in enumerate(clean_f[:4])]
+                formula_str = r"\text{Salary} = \beta_0 + " + " + ".join(terms) + r" + \dots + \beta_n(\text{" + clean_f[-1] + r"}) + \epsilon"
+            else:
+                terms = [r"\beta_{" + str(i+1) + r"}(\text{" + f + r"})" for i, f in enumerate(clean_f)]
+                formula_str = r"\text{Salary} = \beta_0 + " + " + ".join(terms) + r" + \epsilon"
+            st.latex(formula_str)
+            
+            # --- 4. MODEL EĞİTİMİ ---
+            cols_to_use = selected_features + ["Current_Salary"]
+            if use_position and pos_col: cols_to_use.append(pos_col)
+            
+            reg_data = current_season_df[current_season_df["Current_Salary"] > 0].dropna(subset=cols_to_use).copy()
+            
+            if len(reg_data) > 20:
+                X = reg_data[selected_features].copy()
+                if use_position and pos_col:
+                    pos_dummies = pd.get_dummies(reg_data[pos_col], prefix='Pos', drop_first=True).astype(int)
+                    X = pd.concat([X, pos_dummies], axis=1)
+                
+                y = reg_data["Current_Salary"]
+                
+                # Model Fit
+                model = Ridge(alpha=10.0).fit(X, y) if "Ridge" in model_type else LinearRegression().fit(X, y)
+                
+                reg_data["Expected_Salary"] = model.predict(X)
+                reg_data["Difference"] = reg_data["Expected_Salary"] - reg_data["Current_Salary"]
+                
+                # --- 5. SONUÇLAR VE ANALİZ ---
+                st.markdown("---")
+                col_res1, col_res2 = st.columns([1, 2])
+                
+                with col_res1:
+                    st.write("🎯 **Tekil Oyuncu Analizi**")
+                    target_player = st.selectbox("Oyuncu Seçin:", sorted(reg_data["Player"].unique()))
+                    p_info = reg_data[reg_data["Player"] == target_player].iloc[0]
+                    
+                    st.metric("Gerçek Maaş", fmt_money(p_info['Current_Salary']))
+                    st.metric("Tahmini (Adil) Değer", fmt_money(p_info['Expected_Salary']))
+                    
+                    diff = p_info['Difference']
+                    color = "normal" if diff > 0 else "inverse"
+                    st.metric("Durum", "Kelepir" if diff > 0 else "Aşırı Ödeme", delta=fmt_money(diff), delta_color=color)
+
+                with col_res2:
+                    st.write("📈 **Modelin 'Para Ödediği' Metrikler (Beta Katsayıları)**")
+                    # Katsayıları tablo yapalım
+                    coef_df = pd.DataFrame({
+                        "Metrik": X.columns,
+                        "Maaş Etkisi (Dolar)": [f"${int(c):,}" for c in model.coef_]
+                    }).sort_values(by="Metrik")
+                    st.dataframe(coef_df, hide_index=True, use_container_width=True)
+
+                st.markdown("### 🏆 En Değerli / En Şişirilmiş Kontratlar")
+                top_tab1, top_tab2 = st.tabs(["💎 Kelepir Oyuncular (Underpaid)", "💰 Fazla Maaş Alanlar (Overpaid)"])
+                
+                with top_tab1:
+                    st.dataframe(reg_data.nlargest(10, "Difference")[["Player", "Current_Salary", "Expected_Salary", "Difference"]], use_container_width=True)
+                with top_tab2:
+                    st.dataframe(reg_data.nsmallest(10, "Difference")[["Player", "Current_Salary", "Expected_Salary", "Difference"]], use_container_width=True)
+            else:
+                st.warning("Seçilen metrikler için yeterli veri bulunamadı.")
 
     with tab3:
         st.subheader("🤖 K-Means: Pozisyonsuz Basketbol Rolleri")
@@ -456,160 +538,124 @@ elif menu == "7. 🔬 Akademik İstatistik & Tahmin Modelleri":
 
     with tab4:
         st.subheader("🎲 Monte Carlo & AI Kadro Mühendisi")
-        st.write("Kendi belirlediğiniz oyuncularla simülasyon yapabilir veya Yapay Zekanın optimum kadroyu sizin yerinize bulup simülasyona aktarmasını sağlayabilirsiniz.")
-        
-        with st.expander("🧬 Yapay Zeka ile Otomatik Kadro Kur (Simulated Annealing)", expanded=False):
-            st.markdown("Bütçenize ve pozisyon kurallarına (En az 2 PG, SG, vb.) uyan optimum 13 kişilik kadroyu hesaplar.")
-            cap_m_sa = st.slider("Maaş Tavanı (Milyon $)", 100, 250, 140, key="cap_sa")
+
+        if 'ai_roster_key' not in st.session_state:
+            st.session_state['ai_roster_key'] = []
+
+        with st.expander("🧬 AI Kadro Kur (NBA Maaş Kuralları & Şampiyonluk Optimizasyonu)", expanded=True):
+            mode = st.radio("Optimizasyon Hedefi:", ["Aggressive (Maksimum WS)", "Moneyball (Verimlilik)"])
+            c_sa1, c_sa2 = st.columns(2)
+            cap_m_sa = c_sa1.slider("Maaş Tavanı (Milyon $)", 100, 300, 140)
+            roster_size = c_sa2.slider("Kadro Büyüklüğü (Kişi)", 12, 15, 15)
             cap_sa = cap_m_sa * 1000000
             
-            if st.button("🧬 Kadroyu Kur ve Simülasyona Aktar", use_container_width=True):
+            if st.button("🧬 NBA Kurallarına Göre Kadro Kur", use_container_width=True):
                 if pos_col:
-                    sa_df = f_df.groupby('Player').agg({'WS': 'mean', 'Current_Salary': 'first', pos_col: 'first'}).reset_index()
-                    sa_df = sa_df.rename(columns={pos_col: 'Pos'})
-                    sa_df['Final_Salary'] = sa_df['Player'].map(latest_salaries)
-                    sa_df = sa_df[(sa_df['Final_Salary'] > 0) & (sa_df['Final_Salary'] <= cap_sa * 0.35)].dropna(subset=['WS'])
+                    # Sütunları dinamik bul
+                    c_ws = next((x for x in ["WS", "WS_adv"] if x in f_df.columns), "WS")
+                    c_bpm = next((x for x in ["BPM", "BPM_adv"] if x in f_df.columns), "BPM")
+                    c_usg = next((x for x in ["USG%", "USG%_per"] if x in f_df.columns), "USG%")
+                    c_g = next((x for x in ["G", "G_per"] if x in f_df.columns), "G")
+
+                    sa_df = f_df.groupby('Player').agg({
+                        c_ws: 'mean', c_bpm: 'mean', c_usg: 'mean', c_g: 'mean', pos_col: 'first'
+                    }).reset_index().fillna(0).rename(columns={pos_col: 'Pos', c_ws: 'WS', c_bpm: 'BPM', c_usg: 'USG%', c_g: 'G'})
                     
-                    if len(sa_df) > 15:
-                        with st.spinner("Yapay Zeka on binlerce kombinasyonu tarıyor, lütfen bekleyin..."):
-                            current_roster = list(sa_df.sample(13)['Player'].values)
+                    # --- NBA MAAŞ KURALLARI ENTEGRASYONU ---
+                    sa_df['Final_Salary'] = sa_df['Player'].map(latest_salaries).fillna(1100000) # Min Maaş: 1.1M$
+                    
+                    # 1. KURAL: Maksimum Kontrat Sınırı (Bir oyuncu cap'in %35'ini geçemez)
+                    max_contract_limit = cap_sa * 0.35
+                    sa_df = sa_df[sa_df['Final_Salary'] <= max_contract_limit]
+                    
+                    if len(sa_df) >= roster_size:
+                        with st.spinner("AI şampiyonluk kadrosunu CBA kurallarına göre dizayn ediyor..."):
+                            players = sa_df['Player'].tolist()
+                            prob = pulp.LpProblem("NBA_CBA_Opt", pulp.LpMaximize)
+                            p_vars = pulp.LpVariable.dicts("P", players, 0, 1, pulp.LpBinary)
                             
-                            def eval_roster(roster_names):
-                                r_df = sa_df[sa_df['Player'].isin(roster_names)]
-                                cost = r_df['Final_Salary'].sum()
-                                if cost > cap_sa or cost < cap_sa * 0.9: return -999 
-                                
-                                p_str = r_df['Pos'].astype(str).str.upper()
-                                g_c = sum(p_str.str.contains('PG|SG'))
-                                w_c = sum(p_str.str.contains('SF'))
-                                b_c = sum(p_str.str.contains('PF|C'))
-                                if g_c < 4 or w_c < 2 or b_c < 3: return -500 
-                                
-                                return r_df['WS'].sum()
-                            
-                            current_score = eval_roster(current_roster)
-                            best_roster = current_roster.copy()
-                            best_score = current_score
-                            T = 1000.0
-                            cooling_rate = 0.95
-                            all_players = sa_df['Player'].values
-                            
-                            for i in range(1000):
-                                new_roster = current_roster.copy()
-                                p_out = np.random.choice(new_roster)
-                                p_in = np.random.choice([p for p in all_players if p not in new_roster])
-                                new_roster.remove(p_out)
-                                new_roster.append(p_in)
-                                new_score = eval_roster(new_roster)
-                                
-                                if new_score > current_score:
-                                    current_roster = new_roster
-                                    current_score = new_score
-                                    if new_score > best_score:
-                                        best_roster = new_roster.copy()
-                                        best_score = new_score
-                                else:
-                                    acceptance_prob = math.exp((new_score - current_score) / T) if T > 0.1 else 0
-                                    if np.random.rand() < acceptance_prob:
-                                        current_roster = new_roster
-                                        current_score = new_score
-                                T *= cooling_rate
-                            
-                            if best_score > 0:
-                                st.session_state['roster_selection'] = best_roster
-                                st.success("✅ Optimum kadro bulundu ve aşağıdaki simülasyona aktarıldı!")
+                            # Hedef Fonksiyon
+                            if mode == "Aggressive (Maksimum WS)":
+                                prob += pulp.lpSum([(sa_df.loc[sa_df['Player']==p, 'WS'].values[0] + sa_df.loc[sa_df['Player']==p, 'BPM'].values[0]*0.5) * p_vars[p] for p in players])
                             else:
-                                st.error("Geçerli kadro bulunamadı. Bütçeyi artırın.")
-                    else:
-                        st.error("Yeterli oyuncu havuzu bulunamadı.")
-                else:
-                    st.error("Pozisyon sütunu bulunamadı.")
-        
+                                prob += pulp.lpSum([(sa_df.loc[sa_df['Player']==p, 'WS'].values[0] / (sa_df.loc[sa_df['Player']==p, 'Final_Salary'].values[0]/1000000 + 1)) * p_vars[p] for p in players])
+                            
+                            # --- KISITLAR ---
+                            # 2. KURAL: Salary Cap (Üst Sınır)
+                            prob += pulp.lpSum([sa_df.loc[sa_df['Player']==p, 'Final_Salary'].values[0] * p_vars[p] for p in players]) <= cap_sa
+                            
+                            # 3. KURAL: Salary Floor (Alt Sınır - Bütçenin en az %85'ini harcamalı)
+                            prob += pulp.lpSum([sa_df.loc[sa_df['Player']==p, 'Final_Salary'].values[0] * p_vars[p] for p in players]) >= (cap_sa * 0.85)
+                            
+                            prob += pulp.lpSum([p_vars[p] for p in players]) == roster_size
+                            
+                            # Pozisyon ve Yıldız Kısıtları
+                            guards = [p for p in players if any(x in str(sa_df.loc[sa_df['Player']==p, 'Pos'].values[0]).upper() for x in ["G", "PG", "SG"])]
+                            forwards = [p for p in players if any(x in str(sa_df.loc[sa_df['Player']==p, 'Pos'].values[0]).upper() for x in ["F", "SF", "PF"])]
+                            centers = [p for p in players if "C" in str(sa_df.loc[sa_df['Player']==p, 'Pos'].values[0]).upper()]
+                            prob += pulp.lpSum([p_vars[p] for p in guards]) >= 4
+                            prob += pulp.lpSum([p_vars[p] for p in forwards]) >= 4
+                            prob += pulp.lpSum([p_vars[p] for p in centers]) >= 2
+                            
+                            stars = [p for p in players if sa_df.loc[sa_df['Player']==p, 'USG%'].values[0] >= 25.0]
+                            prob += pulp.lpSum([p_vars[p] for p in stars]) <= 2
+                            
+                            prob.solve(pulp.PULP_CBC_CMD(msg=0))
+                            
+                            if pulp.LpStatus[prob.status] == 'Optimal':
+                                st.session_state['ai_roster_key'] = [p for p in players if p_vars[p].varValue == 1.0]
+                                st.rerun()
+                            else:
+                                st.error("❌ CBA Kurallarına uygun kadro bulunamadı. Maaş tavanını veya oyuncu sayısını değiştirin.")
+
         st.markdown("---")
+        sim_roster = st.multiselect("Seçili Kadro:", options=available_players, key='ai_roster_key')
         
-        sim_roster = st.multiselect("Simülasyon İçin Kadro Seçin", available_players, key="roster_selection")
-        
-        if len(sim_roster) >= 5: 
-            agg_dict = {'WS': 'mean', 'BPM': 'mean', 'VORP': 'mean', 'USG%': 'mean', 'G': 'mean'}
-            if pos_col: agg_dict[pos_col] = 'first'
-                
-            m_df = f_df[f_df["Player"].isin(sim_roster)].groupby('Player').agg(agg_dict).reset_index()
-            m_df['Player_Value'] = m_df['WS'] + (m_df['BPM'] * 0.5) + m_df['VORP']
+        if len(sim_roster) >= 5:
+            # 1. VERİLERİ ÇEK VE HAZIRLA
+            c_ws = next((x for x in ["WS", "WS_adv"] if x in f_df.columns), "WS")
+            c_bpm = next((x for x in ["BPM", "BPM_adv"] if x in f_df.columns), "BPM")
+            c_mp = next((x for x in ["MP", "MP_per"] if x in f_df.columns), "MP")
+            c_g = next((x for x in ["G", "G_per"] if x in f_df.columns), "G")
+
+            m_df = f_df[f_df["Player"].isin(sim_roster)].groupby('Player').agg({
+                c_ws: 'mean', c_bpm: 'mean', c_mp: 'mean', c_g: 'mean', pos_col: 'first'
+            }).reset_index().fillna(0).rename(columns={c_ws:'WS', c_bpm:'BPM', c_mp:'MP', c_g:'G', pos_col:'Pos'})
             
-            total_usg = m_df.nlargest(5, 'USG%')['USG%'].sum()
-            usage_penalty = 1.0
-            if total_usg > 115.0: usage_penalty = max(0.75, 1.0 - ((total_usg - 115) * 0.005))
+            # --- GERÇEKÇİ ROTASYON HESABI (84 WS'yi DÜZELTEN KISIM) ---
+            # Sahada toplam 240 dakika var. Oyuncuların sürelerini bu sınıra göre normalize ediyoruz.
+            total_planned_mp = m_df['MP'].sum()
+            normalization_factor = 240 / total_planned_mp if total_planned_mp > 240 else 1.0
             
-            synergy_mult = 1.0
-            g_count, w_count, b_count = 0, 0, 0
-            if pos_col:
-                m_df['Pos_str'] = m_df[pos_col].astype(str).str.upper()
-                g_count = sum(m_df['Pos_str'].str.contains('PG|SG'))
-                w_count = sum(m_df['Pos_str'].str.contains('SF'))
-                b_count = sum(m_df['Pos_str'].str.contains('PF|C'))
-                if g_count < 2: synergy_mult -= 0.1
-                if w_count < 1: synergy_mult -= 0.05
-                if b_count < 2: synergy_mult -= 0.1
+            # Oyuncunun yeni WS'si = (Eski WS / Oynadığı Maç) * (Normalize Edilmiş Dakika) * (Oynayabileceği Maç)
+            # Daha basitçe: Toplam WS'yi 240 dakikaya oranlıyoruz.
+            m_df['Realistic_WS'] = m_df['WS'] * normalization_factor
             
+            # Sinerji ve Ceza (USG% yine önemli)
+            total_usg = f_df[f_df["Player"].isin(sim_roster)].groupby('Player')['USG%'].mean().nlargest(5).sum()
+            usage_penalty = max(0.85, 1.0 - ((total_usg - 115) * 0.005)) if total_usg > 115 else 1.0
+            
+            # 10.000 Sezonluk Monte Carlo
             sim_results = []
             for _ in range(10000):
-                season_value = 0
-                for idx, row in m_df.iterrows():
-                    health_prob = min(row['G'] / 82.0, 0.95) if row['G'] > 0 else 0.85
-                    games_played = np.random.binomial(82, health_prob)
-                    season_value += row['Player_Value'] * (games_played / 82.0)
-                
-                team_wins = season_value * usage_penalty * synergy_mult
-                team_wins = np.random.normal(team_wins, 3.5)
-                sim_results.append(team_wins)
-                
-            simulations = np.array(sim_results)
-            playoff_teams = simulations[simulations >= 45]
-            playoff_prob = (len(playoff_teams) / 10000) * 100
+                # Her sezon oyuncuların sakatlık durumuna göre WS üretimi
+                season_ws = sum([row['Realistic_WS'] * (np.random.binomial(82, min(row['G']/82.0, 0.95))/82.0) for _, row in m_df.iterrows()])
+                # Şans faktörü ve Sinerji ekle
+                final_wins = np.random.normal(season_ws * usage_penalty, 3.5)
+                # NBA'de bir takım 82'den fazla, 0'dan az galibiyet alamaz
+                sim_results.append(max(0, min(82, final_wins)))
             
-            champ_count = 0
-            for w in playoff_teams:
-                rounds = [48, 52, 55, 58]
-                won_championship = True
-                for opp_w in rounds:
-                    p_win_game = w / (w + opp_w)
-                    p_win_series = sum([math.comb(7, k) * (p_win_game**k) * ((1-p_win_game)**(7-k)) for k in range(4, 8)])
-                    if np.random.rand() > p_win_series:
-                        won_championship = False
-                        break
-                if won_championship: champ_count += 1
+            sims = np.array(sim_results)
+            avg_wins = sims.mean()
             
-            champ_prob = (champ_count / 10000) * 100
+            # --- EKRAN ÇIKTILARI (ARTIK GERÇEKÇİ) ---
+            c1, c2, c3 = st.columns(3)
+            # Ham toplam yerine 'Tahmini Galibiyet' olarak gösterelim
+            c1.metric("Tahmini Sezon Sonu Galibiyet", f"{avg_wins:.1f}")
+            c2.metric("Sinerji Etkisi", f"x{usage_penalty:.2f}")
+            c3.metric("Playoff Şansı", f"%{(len(sims[sims >= 44])/10000)*100:.1f}")
             
-            c_ws, c_adv, c_syn = st.columns(3)
-            c_ws.metric("Kadro Saf Yeteneği (WS Toplamı)", f"{m_df['WS'].sum():.1f}")
-            c_adv.metric("Gelişmiş Güç İndeksi", f"{m_df['Player_Value'].sum():.1f}")
-            c_syn.metric("Sinerji & Top Kullanım Çarpanı", f"x{(usage_penalty * synergy_mult):.2f}")
+            st.write(f"ℹ️ **Not:** Toplam WS ({m_df['WS'].sum():.1f}), NBA rotasyon kurallarına (maç başı 240 dk) göre **{avg_wins:.1f}** seviyesine normalize edilmiştir.")
             
-            c_p, c_c = st.columns(2)
-            c_p.metric("Playoff'a Kalma İhtimali", f"%{playoff_prob:.1f}")
-            c_c.metric("Şampiyonluk İhtimali (Bracket Sim)", f"%{champ_prob:.1f}")
-            
-            fig = px.histogram(simulations, nbins=50, title="10.000 Sezonluk Monte Carlo Dağılımı")
-            fig.add_vline(x=45, line_dash="dash", line_color="yellow", annotation_text="Playoff Barajı")
-            st.plotly_chart(fig, use_container_width=True)
-            
-            with st.expander("Takım Analiz Raporunu Göster"):
-                st.write(f"- **Top Kullanım Çatışması:** Kadrodaki top kullanım oranı %{total_usg:.1f}. (Ceza: %{(1-usage_penalty)*100:.1f})")
-                st.write(f"- **Pozisyon Dağılımı:** {g_count} Guard, {w_count} Wing, {b_count} Big")
-            
-            st.markdown("---")
-            st.subheader("📋 Simüle Edilen Takım Kadrosu Detayları")
-            roster_table_data = []
-            for p in sim_roster:
-                p_stats = f_df[f_df["Player"] == p].sort_values("Season").iloc[-1]
-                row_dict = {"Oyuncu": p, "Maaş": fmt_money(latest_salaries.get(p, 0)), "WS": round(p_stats.get("WS", 0), 2), "BPM": round(p_stats.get("BPM", 0), 2), "VORP": round(p_stats.get("VORP", 0), 2), "USG%": round(p_stats.get("USG%", 0), 1)}
-                if pos_col: row_dict["Pozisyon"] = p_stats.get(pos_col, "-")
-                roster_table_data.append(row_dict)
-                
-            roster_display_df = pd.DataFrame(roster_table_data)
-            col_order = ["Oyuncu"] + (["Pozisyon"] if pos_col else []) + ["Maaş", "WS", "BPM", "VORP", "USG%"]
-            st.dataframe(roster_display_df[col_order], use_container_width=True)
-
-        else:
-            st.warning("Simülasyonun çalışması için lütfen en az 5 oyuncu seçin.")
+            st.plotly_chart(px.histogram(sims, title="Galibiyet Dağılımı (Rotasyon Ayarlı)"), use_container_width=True)
+            st.dataframe(m_df[['Player', 'Pos', 'WS', 'Realistic_WS', 'MP']], use_container_width=True)
